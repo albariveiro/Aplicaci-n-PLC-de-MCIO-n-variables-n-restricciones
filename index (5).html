@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OptiMath PLC Pro - Programación Lineal Multivariable</title>
+    <!-- React y ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <!-- Babel para compilar JSX en vivo -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Tailwind CSS para diseño moderno -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Plotly.js para gráficos científicos e interactivos -->
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <!-- Lucide Icons para componentes visuales -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        function App() {
+            // --- CONFIGURACIÓN DE DIMENSIONES DINÁMICAS ---
+            const [numVars, setNumVars] = useState(2);
+            const [numRestricciones, setNumRestricciones] = useState(3);
+            const [tipoObjetivo, setTipoObjetivo] = useState('MAX'); // 'MAX' o 'MIN'
+
+            // Nombres y coeficientes de variables cj
+            const [variables, setVariables] = useState([
+                { id: 1, nombre: 'X1', cj: 3, noNegativa: true },
+                { id: 2, nombre: 'X2', cj: 2, noNegativa: true }
+            ]);
+
+            // Restricciones estructurales
+            const [restricciones, setRestricciones] = useState([
+                { id: 1, coefs: [2, 1], tipo: '<=', bi: 10 },
+                { id: 2, coefs: [1, 2], tipo: '<=', bi: 8 },
+                { id: 3, coefs: [1, 0], tipo: '<=', bi: 4 }
+            ]);
+
+            const [resultado, setResultado] = useState(null);
+            const graficoRef = useRef(null);
+
+            // Sincronizar dimensiones cuando el usuario cambia contadores
+            useEffect(() => {
+                if (variables.length < numVars) {
+                    const nuevas = [...variables];
+                    for (let i = variables.length; i < numVars; i++) {
+                        nuevas.push({ id: i + 1, nombre: `X${i + 1}`, cj: 0, noNegativa: true });
+                    }
+                    setVariables(nuevas);
+                } else if (variables.length > numVars) {
+                    setVariables(variables.slice(0, numVars));
+                }
+
+                const restriccionesAjustadas = restricciones.map(r => {
+                    let nuevosCoefs = [...r.coefs];
+                    if (nuevosCoefs.length < numVars) {
+                        while (nuevosCoefs.length < numVars) nuevosCoefs.push(0);
+                    } else if (nuevosCoefs.length > numVars) {
+                        nuevosCoefs = nuevosCoefs.slice(0, numVars);
+                    }
+                    return { ...r, coefs: nuevosCoefs };
+                });
+
+                if (restriccionesAjustadas.length < numRestricciones) {
+                    while (restriccionesAjustadas.length < numRestricciones) {
+                        const nuevoId = restriccionesAjustadas.length + 1;
+                        restriccionesAjustadas.push({
+                            id: nuevoId,
+                            coefs: Array(numVars).fill(0),
+                            tipo: '<=',
+                            bi: 0
+                        });
+                    }
+                } else if (restriccionesAjustadas.length > numRestricciones) {
+                    restriccionesAjustadas.splice(numRestricciones);
+                }
+
+                setRestricciones(restriccionesAjustadas);
+            }, [numVars, numRestricciones]);
+
+            // Forzar resolución automática ante cualquier cambio en los datos
+            useEffect(() => {
+                resolverSimplex();
+            }, [tipoObjetivo, variables, restricciones, numVars, numRestricciones]);
+
+            // --- MANEJADORES DE INPUTS ---
+            const cambiarCj = (idx, val) => {
+                const v = [...variables];
+                v[idx].cj = parseFloat(val) || 0;
+                setVariables(v);
+            };
+
+            const cambiarNombreVar = (idx, val) => {
+                const v = [...variables];
+                v[idx].nombre = val;
+                setVariables(v);
+            };
+
+            const cambiarNoNegativa = (idx, val) => {
+                const v = [...variables];
+                v[idx].noNegativa = val;
+                setVariables(v);
+            };
+
+            const cambiarAij = (rIdx, vIdx, val) => {
+                const r = [...restricciones];
+                r[rIdx].coefs[vIdx] = parseFloat(val) || 0;
+                setRestricciones(r);
+            };
+
+            const cambiarTipoRestriccion = (rIdx, val) => {
+                const r = [...restricciones];
+                r[rIdx].tipo = val;
+                setRestricciones(r);
+            };
+
+            const cambiarBi = (rIdx, val) => {
+                const r = [...restricciones];
+                r[rIdx].bi = parseFloat(val) || 0;
+                setRestricciones(r);
+            };
+
+            // --- MOTOR MATEMÁTICO: ALGORITMO SIMPLEX TABULAR ---
+            const resolverSimplex = () => {
+                const EPS = 1e-6;
+                const m = restricciones.length;
+                const n = variables.length;
+
+                let rTrabajo = restricciones.map(r => {
+                    if (r.bi < 0) {
+                        let t = r.tipo === '<=' ? '>=' : (r.tipo === '>=' ? '<=' : '=');
+                        return { ...r, coefs: r.coefs.map(c => -c), tipo: t, bi: -r.bi };
+                    }
+                    return { ...r, coefs: [...r.coefs], tipo: r.tipo, bi: r.bi };
+                });
+
+                let numHolguras = 0;
+                let numExcesos = 0;
+                let numArtificiales = 0;
+
+                rTrabajo.forEach(r => {
+                    if (r.tipo === '<=') numHolguras++;
+                    if (r.tipo === '>=') { numExcesos++; numArtificiales++; }
+                    if (r.tipo === '=') numArtificiales++;
+                });
+
+                const totalColumnas = n + numHolguras + numExcesos + numArtificiales + 1;
+                const totalFilas = m + 1;
+
+                let cabeceraMatriz = variables.map(v => v.nombre);
+                for(let i=1; i<=numHolguras; i++) cabeceraMatriz.push(`s${i}`);
+                for(let i=1; i<=numExcesos; i++) cabeceraMatriz.push(`e${i}`);
+                for(let i=1; i<=numArtificiales; i++) cabeceraMatriz.push(`a${i}`);
+                cabeceraMatriz.push("b");
+
+                let tabla = Array(totalFilas).fill(0).map(() => Array(totalColumnas).fill(0));
+                let varBasicas = Array(m).fill("");
+
+                let idxS = n;
+                let idxE = n + numHolguras;
+                let idxA = n + numHolguras + numExcesos;
+
+                let sCont = 1, eCont = 1, aCont = 1;
+
+                for (let i = 0; i < m; i++) {
+                    const r = rTrabajo[i];
+                    for (let j = 0; j < n; j++) tabla[i][j] = r.coefs[j];
+                    
+                    if (r.tipo === '<=') {
+                        tabla[i][idxS] = 1;
+                        varBasicas[i] = `s${sCont}`;
+                        idxS++; sCont++;
+                    } else if (r.tipo === '>=') {
+                        tabla[i][idxE] = -1;
+                        tabla[i][idxA] = 1;
+                        varBasicas[i] = `a${aCont}`;
+                        idxE++; idxA++; eCont++; aCont++;
+                    } else if (r.tipo === '=') {
+                        tabla[i][idxA] = 1;
+                        varBasicas[i] = `a${aCont}`;
+                        idxA++; aCont++;
+                    }
+                    tabla[i][totalColumnas - 1] = r.bi;
+                }
+
+                for (let j = 0; j < n; j++) {
+                    tabla[m][j] = tipoObjetivo === 'MAX' ? -variables[j].cj : variables[j].cj;
+                }
+
+                let iteraciones = 0;
+                const MAX_ITER = 100;
+
+                const ejecutarPivote = (filaPivote, colPivote) => {
+                    const elementoPivote = tabla[filaPivote][colPivote];
+                    for (let j = 0; j < totalColumnas; j++) {
+                        tabla[filaPivote][j] /= elementoPivote;
+                    }
+                    for (let i = 0; i < totalFilas; i++) {
+                        if (i !== filaPivote) {
+                            const factor = tabla[i][colPivote];
+                            for (let j = 0; j < totalColumnas; j++) {
+                                tabla[i][j] -= factor * tabla[filaPivote][j];
+                            }
+                        }
+                    }
+                };
+
+                while (iteraciones < MAX_ITER) {
+                    let colPivote = -1;
+                    let minCoste = -EPS;
+                    for (let j = 0; j < totalColumnas - 1; j++) {
+                        if (tabla[m][j] < minCoste) {
+                            minCoste = tabla[m][j];
+                            colPivote = j;
+                        }
+                    }
+
+                    if (colPivote === -1) break;
+
+                    let filaPivote = -1;
+                    let razonMinima = Infinity;
+                    for (let i = 0; i < m; i++) {
+                        if (tabla[i][colPivote] > EPS) {
+                            const razon = tabla[i][totalColumnas - 1] / tabla[i][colPivote];
+                            if (razon < razonMinima) {
+                                razonMinima = razon;
+                                filaPivote = i;
+                            }
+                        }
+                    }
+
+                    if (filaPivote === -1) {
+                        setResultado({ estado: 'NO_ACOTADO', mensaje: 'El modelo no está acotado. La función objetivo puede crecer sin límite.' });
+                        return;
+                    }
+
+                    varBasicas[filaPivote] = cabeceraMatriz[colPivote];
+                    ejecutarPivote(filaPivote, colPivote);
+                    iteraciones++;
+                }
+
+                let valoresVariables = Array(n).fill(0);
+                for (let j = 0; j < n; j++) {
+                    const nombreBuscado = variables[j].nombre;
+                    const filaIdx = varBasicas.indexOf(nombreBuscado);
+                    if (filaIdx !== -1) {
+                        valoresVariables[j] = Math.max(0, tabla[filaIdx][totalColumnas - 1]);
+                    }
+                }
+
+                const valorZOptimo = tabla[m][totalColumnas - 1] * (tipoObjetivo === 'MAX' ? 1 : -1);
+
+                const estadoRestricciones = restricciones.map((r, idx) => {
+                    let total = 0;
+                    for (let j = 0; j < n; j++) total += r.coefs[j] * valoresVariables[j];
+                    const esActiva = Math.abs(total - r.bi) < EPS;
+                    return {
+                        id: r.id,
+                        valorCalculado: Number(total.toFixed(4)),
+                        bi: r.bi,
+                        estado: esActiva ? 'Activa (Frontera)' : 'Inactiva (Holgura)'
+                    };
+                });
+
+                // --- GENERACIÓN DE VÉRTICES PARA GRÁFICA EN CASO 2 VARS ---
+                let verticesFactibles = [];
+                if (n === 2) {
+                    let lineas = [];
+                    restricciones.forEach(r => lineas.push({ a1: r.coefs[0], a2: r.coefs[1], b: r.bi }));
+                    if (variables[0].noNegativa) lineas.push({ a1: 1, a2: 0, b: 0 });
+                    if (variables[1].noNegativa) lineas.push({ a1: 0, a2: 1, b: 0 });
+
+                    let intersectados = [];
+                    for (let i = 0; i < lineas.length; i++) {
+                        for (let j = i + 1; j < lineas.length; j++) {
+                            const L1 = lineas[i];
+                            const L2 = lineas[j];
+                            const det = L1.a1 * L2.a2 - L1.a2 * L2.a1;
+                            if (Math.abs(det) < EPS) continue;
+
+                            const x1 = (L1.b * L2.a2 - L1.a2 * L2.b) / det;
+                            const x2 = (L1.a1 * L2.b - L1.b * L2.a1) / det;
+
+                            if (x1 >= -EPS && x2 >= -EPS) intersectados.push({ x1, x2 });
+                        }
+                    }
+
+                    verticesFactibles = intersectados.filter(p => {
+                        if (variables[0].noNegativa && p.x1 < -EPS) return false;
+                        if (variables[1].noNegativa && p.x2 < -EPS) return false;
+                        for (let r of restricciones) {
+                            const val = r.coefs[0] * p.x1 + r.coefs[1] * p.x2;
+                            if (r.tipo === '<=' && val > r.bi + EPS) return false;
+                            if (r.tipo === '>=' && val < r.bi - EPS) return false;
+                            if (r.tipo === '=' && Math.abs(val - r.bi) > EPS) return false;
+                        }
+                        return true;
+                    });
+
+                    let unicos = [];
+                    verticesFactibles.forEach(v => {
+                        if (!unicos.some(u => Math.abs(u.x1 - v.x1) < 1e-4 && Math.abs(u.x2 - v.x2) < 1e-4)) {
+                            unicos.push(v);
+                        }
+                    });
+                    verticesFactibles = unicos;
+                }
+
+                setResultado({
+                    estado: 'OPTIMO',
+                    mensaje: 'Solución óptima encontrada mediante el algoritmo Simplex Tabular.',
+                    variablesSol: variables.map((v, i) => ({ nombre: v.nombre, valor: Number(valoresVariables[i].toFixed(4)) })),
+                    z: Number(valorZOptimo.toFixed(4)),
+                    estadoRestricciones,
+                    tablaFinal: tabla.map(fila => fila.map(val => Number(val.toFixed(4)))),
+                    cabeceraMatriz,
+                    varBasicas,
+                    verticesFactibles,
+                    x1Opt: valoresVariables[0] || 0,
+                    x2Opt: valoresVariables[1] || 0
+                });
+            };
+
+            // --- RENDERIZADO DEL GRÁFICO PLOTLY ---
+            useEffect(() => {
+                if (numVars !== 2 || !resultado || !graficoRef.current) return;
+
+                let maxDimX = 10;
+                let maxDimY = 10;
+                
+                restricciones.forEach(r => {
+                    if (r.coefs[0] > 0) maxDimX = Math.max(maxDimX, r.bi / r.coefs[0]);
+                    if (r.coefs[1] > 0) maxDimY = Math.max(maxDimY, r.bi / r.coefs[1]);
+                });
+                maxDimX = Math.min(maxDimX * 1.3, 100);
+                maxDimY = Math.min(maxDimY * 1.3, 100);
+
+                let dataData = [];
+
+                if (resultado.verticesFactibles && resultado.verticesFactibles.length > 2) {
+                    const cx = resultado.verticesFactibles.reduce((sum, v) => sum + v.x1, 0) / resultado.verticesFactibles.length;
+                    const cy = resultado.verticesFactibles.reduce((sum, v) => sum + v.x2, 0) / resultado.verticesFactibles.length;
+                    
+                    let vOrdenados = [...resultado.verticesFactibles].sort((a, b) => {
+                        return Math.atan2(a.x2 - cy, a.x1 - cx) - Math.atan2(b.x2 - cy, b.x1 - cx);
+                    });
+
+                    vOrdenados.push(vOrdenados[0]);
+
+                    dataData.push({
+                        x: vOrdenados.map(v => v.x1),
+                        y: vOrdenados.map(v => v.x2),
+                        fill: 'toself',
+                        fillcolor: 'rgba(79, 70, 229, 0.2)',
+                        line: { color: 'transparent' },
+                        name: 'Región Factible',
+                        type: 'scatter',
+                        mode: 'lines'
+                    });
+                }
+
+                restricciones.forEach((r, idx) => {
+                    let xPts = [0, maxDimX];
+                    let yPts = [0, maxDimY];
+
+                    if (Math.abs(r.coefs[1]) > 1e-6) {
+                        yPts = [ (r.bi - r.coefs[0] * 0) / r.coefs[1], (r.bi - r.coefs[0] * maxDimX) / r.coefs[1] ];
+                    } else if (Math.abs(r.coefs[0]) > 1e-6) {
+                        xPts = [r.bi / r.coefs[0], r.bi / r.coefs[0]];
+                        yPts = [0, maxDimY];
+                    }
+
+                    dataData.push({
+                        x: xPts,
+                        y: yPts,
+                        mode: 'lines',
+                        name: `R${idx + 1}`,
+                        line: { width: 2 }
+                    });
+                });
+
+                if (resultado.verticesFactibles) {
+                    dataData.push({
+                        x: resultado.verticesFactibles.map(v => v.x1),
+                        y: resultado.verticesFactibles.map(v => v.x2),
+                        mode: 'markers',
+                        type: 'scatter',
+                        name: 'Vértices',
+                        marker: { color: '#475569', size: 8 }
+                    });
+                }
+
+                dataData.push({
+                    x: [resultado.x1Opt],
+                    y: [resultado.x2Opt],
+                    mode: 'markers',
+                    type: 'scatter',
+                    name: 'Óptimo (*)',
+                    marker: { color: '#ef4444', size: 14, symbol: 'star' }
+                });
+
+                const layout = {
+                    title: { text: 'Espacio de Soluciones Geométrico', font: { size: 14 } },
+                    xaxis: { title: variables[0]?.nombre || 'X1', range: [-0.5, maxDimX] },
+                    yaxis: { title: variables[1]?.nombre || 'X2', range: [-0.5, maxDimY] },
+                    margin: { l: 40, r: 10, t: 40, b: 40 },
+                    plot_bgcolor: '#ffffff',
+                    paper_bgcolor: '#ffffff',
+                    legend: { orientation: 'h', y: -0.2 },
+                    hovermode: 'closest'
+                };
+
+                Plotly.newPlot(graficoRef.current, dataData, layout, { displayModeBar: false, responsive: true });
+            }, [resultado, numVars]);
+
+            return (
+                <div class="max-w-7xl mx-auto p-4 lg:p-8">
+                    <header class="mb-8 border-b border-slate-200 pb-5 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                        <div>
+                            <div class="flex items-center gap-3 mb-2">
+                                <span class="bg-indigo-600 text-white p-2 rounded-lg"><i data-lucide="layers"></i></span>
+                                <h1 class="text-3xl font-extrabold text-slate-900 tracking-tight">OptiMath PLC Pro</h1>
+                            </div>
+                            <p class="text-slate-500">Resolución Simplex Tabular y visualización interactiva simultánea para n variables.</p>
+                        </div>
+                        
+                        <div class="flex items-center gap-4 bg-white p-3 rounded-xl shadow-sm border border-slate-200 self-start">
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs font-bold text-slate-500 uppercase">Variables:</span>
+                                <input type="number" min="2" max="6" value={numVars} onChange={(e) => setNumVars(parseInt(e.target.value) || 2)} class="w-12 text-center font-bold bg-slate-50 border rounded p-1" />
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs font-bold text-slate-500 uppercase">Restricciones:</span>
+                                <input type="number" min="2" max="6" value={numRestricciones} onChange={(e) => setNumRestricciones(parseInt(e.target.value) || 2)} class="w-12 text-center font-bold bg-slate-50 border rounded p-1" />
+                            </div>
+                        </div>
+                    </header>
+
+                    <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                        {/* COLUMNA PARAMETRIZACIÓN */}
+                        <div class="lg:col-span-5 space-y-6">
+                            <section class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                                <h2 class="text-base font-bold text-slate-900 mb-4 border-b border-slate-100 pb-2 flex justify-between items-center">
+                                    <span>Función Objetivo & Coeficientes cⱼ</span>
+                                    <div class="flex bg-slate-100 p-0.5 rounded-lg border text-xs">
+                                        <button onClick={() => setTipoObjetivo('MAX')} class={`px-2 py-1 rounded font-bold ${tipoObjetivo === 'MAX' ? 'bg-indigo-600 text-white' : 'text-slate-600'}`}>MAX</button>
+                                        <button onClick={() => setTipoObjetivo('MIN')} class={`px-2 py-1 rounded font-bold ${tipoObjetivo === 'MIN' ? 'bg-indigo-600 text-white' : 'text-slate-600'}`}>MIN</button>
+                                    </div>
+                                </h2>
+                                
+                                <div class="grid grid-cols-2 gap-3">
+                                    {variables.map((v, idx) => (
+                                        <div key={v.id} class="bg-slate-50 p-2.5 rounded-lg border border-slate-200 text-sm">
+                                            <div class="flex justify-between items-center mb-1">
+                                                <input type="text" value={v.nombre} onChange={(e) => cambiarNombreVar(idx, e.target.value)} class="font-bold text-indigo-600 bg-transparent max-w-[60px] outline-none" />
+                                                <span class="text-[10px] font-bold text-slate-400">cⱼ</span>
+                                            </div>
+                                            <input type="number" value={v.cj} onChange={(e) => cambiarCj(idx, e.target.value)} class="w-full bg-white border rounded px-2 py-1 font-semibold" />
+                                            <label class="flex items-center gap-1.5 text-[11px] text-slate-500 mt-1.5 cursor-pointer">
+                                                <input type="checkbox" checked={v.noNegativa} onChange={(e) => cambiarNoNegativa(idx, e.target.checked)} class="rounded text-indigo-600" />
+                                                {v.nombre} &ge; 0
+                                            </label>
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+
+                            <section class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                                <h2 class="text-base font-bold text-slate-900 mb-4 border-b border-slate-100 pb-2">Matriz de Restricciones (aᵢⱼ)</h2>
+                                <div class="space-y-3">
+                                    {restricciones.map((r, rIdx) => (
+                                        <div key={r.id} class="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-2">
+                                            <div class="font-bold text-slate-400">Fila Restricción R{rIdx + 1}</div>
+                                            <div class="flex flex-wrap items-center gap-2">
+                                                {r.coefs.map((c, vIdx) => (
+                                                    <div key={vIdx} class="flex items-center gap-1">
+                                                        <input type="number" value={c} onChange={(e) => cambiarAij(rIdx, vIdx, e.target.value)} class="w-14 bg-white border rounded p-1 text-center" />
+                                                        <span class="text-slate-500 font-semibold">{variables[vIdx]?.nombre || `X${vIdx+1}`}</span>
+                                                        {vIdx < r.coefs.length - 1 && <span class="text-slate-400 font-bold">+</span>}
+                                                    </div>
+                                                ))}
+                                                
+                                                <select value={r.tipo} onChange={(e) => cambiarTipoRestriccion(rIdx, e.target.value)} class="border rounded bg-white p-1 font-bold">
+                                                    <option value="&lt;=">&le;</option>
+                                                    <option value="&gt;=">&ge;</option>
+                                                    <option value="=">=</option>
+                                                </select>
+
+                                                <input type="number" value={r.bi} onChange={(e) => cambiarBi(rIdx, e.target.value)} class="w-16 bg-indigo-50 border font-bold rounded p-1 text-center" />
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+
+                            <section class="bg-slate-900 text-slate-100 p-5 rounded-xl shadow-md font-mono text-xs space-y-2">
+                                <div class="text-slate-400 uppercase font-bold text-[10px]">Modelo Matemático Estructural</div>
+                                <div class="text-emerald-400 font-bold">
+                                    {tipoObjetivo === 'MAX' ? 'Max' : 'Min'} Z = {variables.map((v, i) => `${v.cj}${v.nombre}`).join(' + ')}
+                                </div>
+                                <div class="text-slate-400">s.a.</div>
+                                <div class="space-y-1 pl-3 border-l border-slate-700 text-slate-300">
+                                    {restricciones.map((r) => (
+                                        <div key={r.id}>
+                                            {r.coefs.map((c, idx) => `${c}${variables[idx]?.nombre || ''}`).join(' + ')} {r.tipo} {r.bi}
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+                        </div>
+
+                        {/* COLUMNA RESULTADOS Y GRÁFICO */}
+                        <div class="lg:col-span-7 space-y-6">
+                            {numVars === 2 && (
+                                <section class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                                    <h2 class="text-base font-bold text-slate-900 mb-2 border-b pb-2">Representación Gráfica (2D)</h2>
+                                    <div ref={graficoRef} class="w-full bg-slate-50 rounded-xl" style={{ height: '350px' }}></div>
+                                </section>
+                            )}
+
+                            {resultado && (
+                                <>
+                                    <section class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
+                                        <h2 class="text-base font-bold text-slate-900">Resultados del Vector de Decisión</h2>
+                                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                            {resultado.variablesSol.map((v, idx) => (
+                                                <div key={idx} class="bg-slate-50 p-3 rounded-lg border text-center">
+                                                    <span class="text-xs font-bold text-slate-400 uppercase">{v.nombre}*</span>
+                                                    <div class="text-xl font-black text-slate-900 mt-1">{v.valor}</div>
+                                                </div>
+                                            ))}
+                                            <div class="bg-indigo-600 text-white p-3 rounded-lg text-center shadow-sm">
+                                                <span class="text-xs font-bold opacity-80 uppercase">Z* Óptimo</span>
+                                                <div class="text-xl font-black mt-1">{resultado.z}</div>
+                                            </div>
+                                        </div>
+                                    </section>
+
+                                    <section class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                                        <h3 class="text-xs font-bold text-slate-400 uppercase mb-3">Holgura e Impacto de Restricciones</h3>
+                                        <div class="overflow-x-auto rounded-xl border">
+                                            <table class="w-full text-left text-xs">
+                                                <thead>
+                                                    <tr class="bg-slate-50 border-b text-slate-600 font-bold">
+                                                        <th class="p-3">Restricción</th>
+                                                        <th class="p-3">Evaluación (aᵢⱼxⱼ)</th>
+                                                        <th class="p-3">Término Disponible (bᵢ)</th>
+                                                        <th class="p-3">Estado</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody class="divide-y">
+                                                    {resultado.estadoRestricciones.map((r, i) => (
+                                                        <tr key={r.id}>
+                                                            <td class="p-3 font-bold text-slate-700">R{i + 1}</td>
+                                                            <td class="p-3 font-mono">{r.valorCalculado}</td>
+                                                            <td class="p-3 font-mono font-semibold">{r.bi}</td>
+                                                            <td class="p-3">
+                                                                <span class={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold ${r.estado.includes('Activa') ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600'}`}>
+                                                                    {r.estado}
+                                                                </span>
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </section>
+
+                                    <section class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-3">
+                                        <div>
+                                            <h3 class="text-sm font-bold text-slate-900">Tabla Simplex Final (Matriz Gauss-Jordan)</h3>
+                                        </div>
+                                        <div class="overflow-x-auto rounded-xl border">
+                                            <table class="w-full text-left font-mono text-[11px]">
+                                                <thead>
+                                                    <tr class="bg-slate-800 text-slate-200 font-bold">
+                                                        <th class="p-2.5">Base</th>
+                                                        {resultado.cabeceraMatriz.map((h, i) => (
+                                                            <th key={i} class="p-2.5 text-center">{h}</th>
+                                                        ))}
+                                                    </tr>
+                                                </thead>
+                                                <tbody class="divide-y">
+                                                    {resultado.tablaFinal.slice(0, -1).map((fila, i) => (
+                                                        <tr key={i}>
+                                                            <td class="p-2.5 font-bold bg-slate-50 text-indigo-600">{resultado.varBasicas[i]}</td>
+                                                            {fila.map((val, j) => (
+                                                                <td key={j} class={`p-2.5 text-center ${j === fila.length - 1 ? 'font-bold bg-emerald-50 text-emerald-900' : ''}`}>{val}</td>
+                                                            ))}
+                                                        </tr>
+                                                    ))}
+                                                    <tr class="bg-indigo-50/70 font-bold">
+                                                        <td class="p-2.5 text-indigo-900">Fila Z</td>
+                                                        {resultado.tablaFinal[resultado.tablaFinal.length - 1].map((val, j) => (
+                                                            <td key={j} class={`p-2.5 text-center ${j === resultado.tablaFinal[0].length - 1 ? 'text-indigo-900' : 'text-slate-700'}`}>{val}</td>
+                                                        ))}
+                                                    </tr>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </section>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+        setTimeout(() => { if (typeof lucide !== 'undefined') lucide.createIcons(); }, 400);
+    </script>
+</body>
+</html>
